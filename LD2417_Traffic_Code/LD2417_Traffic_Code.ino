@@ -57,22 +57,13 @@
 #define RADAR_SERIAL        Serial2
 #define RADAR_RX_PIN        16   // ESP32 pin wired to LD2417 TX
 #define RADAR_TX_PIN        17   // ESP32 pin wired to LD2417 RX
-#define RADAR_BAUD          256000  // Hi-Link "LD" series default
+#define RADAR_BAUD          115200  // LD2417 factory default (not LD2451's 256000)
 
-static const uint8_t FRAME_HEADER[4] = {0xF4, 0xF3, 0xF2, 0xF1};  // <-- VERIFY
-static const uint8_t FRAME_TAIL[4]   = {0xF8, 0xF7, 0xF6, 0xF5};  // <-- VERIFY
+static const uint8_t FRAME_HEADER[2] = {0xAA, 0xAA};
+static const uint8_t FRAME_TAIL[2]   = {0x55, 0x55};
 
 static const uint8_t MAX_TARGETS_PER_FRAME = 8;
-static const uint16_t RX_BUF_SIZE = 512;   // ring buffer for incoming bytes
-
-// Byte layout of a single target record -- VERIFY against datasheet.
-// Assumed: 3x signed little-endian int16: distance_cm, speed_kmh, angle_deg
-struct TargetRecordRaw {
-  int16_t distance_cm;
-  int16_t speed_kmh;
-  int16_t angle_deg;
-};
-static const uint8_t TARGET_RECORD_SIZE = sizeof(TargetRecordRaw);  // 6 bytes
+static const uint8_t TARGET_RECORD_SIZE = 7;  // dir(1) + dist(2) + speed(2) + status(2)
 
 // Lane mapping config -- tune to your physical mounting
 static const uint8_t  LANE_COUNT     = 3;
@@ -97,9 +88,9 @@ struct Target {
   int8_t lane;  // -1 = outside configured lane span
 };
 
-// Simple ring buffer for accumulating serial bytes until we find a full frame
-uint8_t rxBuf[RX_BUF_SIZE];
-uint16_t rxLen = 0;
+// Compact frame reassembly buffer
+uint8_t compactFrame[16];
+uint8_t compactLen = 0;
 
 // Per-lane distance history for fallback speed estimation
 static const uint8_t HISTORY_LEN = 5;
@@ -114,18 +105,6 @@ LaneHistory laneHistory[LANE_COUNT + 1];  // 1-indexed, index 0 unused
 // ----------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------
-
-int findSequence(const uint8_t* buf, uint16_t bufLen, const uint8_t* seq, uint8_t seqLen, int startAt = 0) {
-  if (bufLen < seqLen) return -1;
-  for (int i = startAt; i <= (int)bufLen - (int)seqLen; i++) {
-    bool match = true;
-    for (uint8_t j = 0; j < seqLen; j++) {
-      if (buf[i + j] != seq[j]) { match = false; break; }
-    }
-    if (match) return i;
-  }
-  return -1;
-}
 
 int8_t assignLane(float lateralM) {
   float adjusted = lateralM - CENTER_OFFSET_M;
@@ -163,24 +142,56 @@ float estimateFallbackSpeedKmh(int8_t lane, float distanceM, unsigned long nowMs
 // Frame parsing
 // ----------------------------------------------------------------------
 
-// Parses one frame payload (bytes between header and tail) into targets.
-// Returns the number of targets written into outTargets (capped at MAX_TARGETS_PER_FRAME).
+// Parses LD2417 compact 10-byte target frame (AA AA ... no trailing 55 55).
+// Bytes 5-6: distance (m * 100), 7-8: speed (km/h * 100), 9: direction flag.
+uint8_t parseCompactFrame(const uint8_t* frame, uint16_t len, Target* outTargets) {
+  if (len < 10) return 0;
+
+  uint8_t status = frame[2];
+  if (status == 0x00) return 0;
+
+  uint16_t rawDistance = frame[5] | (frame[6] << 8);
+  uint16_t rawSpeed = frame[7] | (frame[8] << 8);
+
+  if (rawDistance == 0 && rawSpeed == 0) return 0;
+
+  Target t;
+  t.distanceM = rawDistance / 100.0f;
+  t.speedKmh  = rawSpeed / 100.0f;
+  t.angleDeg  = 0.0f;
+  t.lateralM  = 0.0f;
+  t.lane      = -1;  // compact frame has no lateral angle — tune lane mapping separately
+
+  outTargets[0] = t;
+  return 1;
+}
+
+// Parses LD2417 multi-target payload: [target_count][7-byte records...] 55 55 delimited.
 uint8_t parseTargets(const uint8_t* payload, uint16_t payloadLen, Target* outTargets) {
+  if (payloadLen < 1) return 0;
+
+  uint8_t targetCount = payload[0];
+  if (targetCount == 0) return 0;
+  if (targetCount > MAX_TARGETS_PER_FRAME) targetCount = MAX_TARGETS_PER_FRAME;
+
+  uint16_t expectedLen = 1 + (uint16_t)targetCount * TARGET_RECORD_SIZE;
+  if (payloadLen < expectedLen) targetCount = (payloadLen - 1) / TARGET_RECORD_SIZE;
+
   uint8_t count = 0;
-  uint16_t nRecords = payloadLen / TARGET_RECORD_SIZE;
-  if (nRecords > MAX_TARGETS_PER_FRAME) nRecords = MAX_TARGETS_PER_FRAME;
+  uint16_t offset = 1;
+  for (uint8_t i = 0; i < targetCount; i++) {
+    uint8_t direction = payload[offset];
+    uint16_t rawDistance = payload[offset + 1] | (payload[offset + 2] << 8);
+    uint16_t rawSpeed = payload[offset + 3] | (payload[offset + 4] << 8);
+    offset += TARGET_RECORD_SIZE;
 
-  for (uint16_t i = 0; i < nRecords; i++) {
-    TargetRecordRaw raw;
-    memcpy(&raw, payload + i * TARGET_RECORD_SIZE, sizeof(raw));
-
-    // All-zero record usually means "empty slot" -- skip it.
-    if (raw.distance_cm == 0 && raw.speed_kmh == 0 && raw.angle_deg == 0) continue;
+    if (rawDistance == 0 && rawSpeed == 0) continue;
 
     Target t;
-    t.distanceM = raw.distance_cm / 100.0f;   // assumed cm -> m, VERIFY
-    t.speedKmh  = (float)raw.speed_kmh;        // assumed already km/h, VERIFY
-    t.angleDeg  = (float)raw.angle_deg;
+    t.distanceM = rawDistance / 100.0f;
+    t.speedKmh  = rawSpeed / 100.0f;
+    // LD2417 reports left/right bearing, not degrees — use nominal angle for lane math.
+    t.angleDeg  = (direction == 1) ? -45.0f : (direction == 2) ? 45.0f : 0.0f;
     t.lateralM  = t.distanceM * sinf(radians(t.angleDeg));
     t.lane      = assignLane(t.lateralM);
 
@@ -198,9 +209,46 @@ void printFrameHex(const uint8_t* payload, uint16_t len) {
   Serial.println();
 }
 
+void handleCompactFrame(const uint8_t* frame, uint16_t len) {
+  if (DEBUG_RAW) {
+    printFrameHex(frame, len);
+    return;
+  }
+
+  if (len == 5 && frame[2] == 0x00) {
+    Serial.printf("[%lu] Area clear — no target detected.\n", millis());
+    return;
+  }
+
+  Target targets[MAX_TARGETS_PER_FRAME];
+  uint8_t n = parseCompactFrame(frame, len, targets);
+  if (n == 0) return;
+
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < n; i++) {
+    Target& t = targets[i];
+
+    float speed = t.speedKmh;
+    if (USE_FALLBACK_SPEED && t.lane > 0) {
+      float est = estimateFallbackSpeedKmh(t.lane, t.distanceM, now);
+      if (!isnan(est)) speed = est;
+    }
+
+    Serial.printf("[%lu] Lane %s  dist=%6.2f m  speed=%6.1f km/h  angle=%6.1f deg\n",
+                  now,
+                  (t.lane > 0) ? String(t.lane).c_str() : "?",
+                  t.distanceM, speed, t.angleDeg);
+  }
+}
+
 void handleFrame(const uint8_t* payload, uint16_t len) {
   if (DEBUG_RAW) {
     printFrameHex(payload, len);
+    return;
+  }
+
+  if (len >= 1 && payload[0] == 0) {
+    Serial.printf("[%lu] Area clear — no target detected.\n", millis());
     return;
   }
 
@@ -228,43 +276,26 @@ void handleFrame(const uint8_t* payload, uint16_t len) {
 }
 
 // ----------------------------------------------------------------------
-// Serial ingestion: pull bytes into rxBuf, scan for complete frames
+// Serial ingestion: sync on AA AA frames
 // ----------------------------------------------------------------------
 
 void pollRadar() {
   while (RADAR_SERIAL.available()) {
-    if (rxLen >= RX_BUF_SIZE) {
-      // Buffer full without finding a valid frame -- reset to avoid lockup.
-      rxLen = 0;
-    }
-    rxBuf[rxLen++] = (uint8_t)RADAR_SERIAL.read();
-  }
+    uint8_t b = (uint8_t)RADAR_SERIAL.read();
 
-  while (true) {
-    int start = findSequence(rxBuf, rxLen, FRAME_HEADER, sizeof(FRAME_HEADER));
-    if (start == -1) {
-      // No header found; if buffer is getting large, clear stale data.
-      if (rxLen > RX_BUF_SIZE - 32) rxLen = 0;
-      return;
-    }
-    int end = findSequence(rxBuf, rxLen, FRAME_TAIL, sizeof(FRAME_TAIL), start + sizeof(FRAME_HEADER));
-    if (end == -1) {
-      // Header found but tail hasn't arrived yet. Discard junk before
-      // the header and wait for more bytes.
-      if (start > 0) {
-        memmove(rxBuf, rxBuf + start, rxLen - start);
-        rxLen -= start;
-      }
-      return;
-    }
+    if (compactLen == 0 && b != FRAME_HEADER[0]) continue;
+    if (compactLen == 1 && b != FRAME_HEADER[1]) { compactLen = 0; continue; }
+    compactFrame[compactLen++] = b;
+    if (compactLen >= sizeof(compactFrame)) { compactLen = 0; continue; }
 
-    uint16_t payloadStart = start + sizeof(FRAME_HEADER);
-    uint16_t payloadLen = end - payloadStart;
-    handleFrame(rxBuf + payloadStart, payloadLen);
-
-    uint16_t consumed = end + sizeof(FRAME_TAIL);
-    memmove(rxBuf, rxBuf + consumed, rxLen - consumed);
-    rxLen -= consumed;
+    if (compactLen == 5 && compactFrame[2] == 0x00 &&
+        compactFrame[3] == FRAME_TAIL[0] && compactFrame[4] == FRAME_TAIL[1]) {
+      handleCompactFrame(compactFrame, 5);
+      compactLen = 0;
+    } else if (compactLen == 10) {
+      handleCompactFrame(compactFrame, 10);
+      compactLen = 0;
+    }
   }
 }
 
