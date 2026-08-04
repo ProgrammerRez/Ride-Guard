@@ -1,8 +1,6 @@
 /*
   Device 1: HLK-LD2417 Radar + MPU6050 + ESP-NOW Sender
-  =======================================================================
-  Continuously streams radar status (danger state and closest distance) 
-  to the receiver at 10Hz.
+  Streams full telemetry data including MPU angles, gyro rates, and turn detection.
 */
 
 #include <Wire.h>
@@ -11,18 +9,16 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
-// ----------------------------------------------------------------------
-// Code 1 (MPU6050) Variables
-// ----------------------------------------------------------------------
 const int MPU_addr = 0x68;
 const float alpha = 0.98;
 float pitch = 0, roll = 0;
+float gyroZ = 0;            // Rotation rate around Z-axis (Yaw)
+bool isTurning = false;     // Turn detection flag
+const float TURN_THRESHOLD = 45.0; // Degrees per second threshold to classify as "Turning"
+
 unsigned long previousMillis = 0;
 const long interval = 10; 
 
-// ----------------------------------------------------------------------
-// Code 2 (LD2417) CONFIG
-// ----------------------------------------------------------------------
 #define RADAR_SERIAL        Serial2
 #define RADAR_RX_PIN        16   
 #define RADAR_TX_PIN        17   
@@ -48,29 +44,26 @@ struct Target {
 uint8_t compactFrame[16];
 uint8_t compactLen = 0;
 
-// ----------------------------------------------------------------------
-// ESP-NOW / Streaming Configuration
-// ----------------------------------------------------------------------
 // REPLACE WITH THE MAC ADDRESS OF YOUR RECEIVER ESP32
 uint8_t receiverAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
 
+// Expanded structure to stream gyro data, angles, and turn status
 typedef struct struct_message {
   bool vibrate;
-  float closestDistance; // Added data stream
+  float closestDistance;
+  float pitch;
+  float roll;
+  float gyroZ;
+  bool isTurning;
+  uint8_t targetCount;
+  Target targets[MAX_TARGETS_PER_FRAME];
 } struct_message;
 
 struct_message alertData;
 esp_now_peer_info_t peerInfo;
 
-// Streaming variables
-bool currentDanger = false;
-float currentClosest = 0.0f;
 unsigned long lastStreamTime = 0;
-const unsigned long STREAM_INTERVAL = 100; // Stream data every 100ms (10Hz)
-
-// ----------------------------------------------------------------------
-// Helpers & Parsing
-// ----------------------------------------------------------------------
+const unsigned long STREAM_INTERVAL = 100; 
 
 int8_t assignLane(float lateralM) {
   float adjusted = lateralM - CENTER_OFFSET_M;
@@ -134,12 +127,14 @@ uint8_t parseTargets(const uint8_t* payload, uint16_t payloadLen, Target* outTar
   return count;
 }
 
-// Update the global state based on targets detected
-void evaluateTargets(Target* targets, uint8_t n) {
+void processFrameData(Target* targets, uint8_t n) {
   bool danger = false;
   float closest = 999.0f;
   
+  alertData.targetCount = n;
   for (uint8_t i = 0; i < n; i++) {
+    alertData.targets[i] = targets[i];
+    
     if (targets[i].distanceM > 0.0f) {
       if (targets[i].distanceM < closest) {
         closest = targets[i].distanceM;
@@ -150,32 +145,34 @@ void evaluateTargets(Target* targets, uint8_t n) {
     }
   }
   
-  currentDanger = danger;
-  currentClosest = (closest == 999.0f) ? 0.0f : closest;
+  alertData.vibrate = danger;
+  alertData.closestDistance = (closest == 999.0f) ? 0.0f : closest;
 }
 
 void handleCompactFrame(const uint8_t* frame, uint16_t len) {
   if (len == 5 && frame[2] == 0x00) {
-    currentDanger = false;
-    currentClosest = 0.0f;
+    alertData.vibrate = false;
+    alertData.closestDistance = 0.0f;
+    alertData.targetCount = 0;
     return;
   }
 
   Target targets[MAX_TARGETS_PER_FRAME];
   uint8_t n = parseCompactFrame(frame, len, targets);
-  if (n > 0) evaluateTargets(targets, n);
+  if (n > 0) processFrameData(targets, n);
 }
 
 void handleFrame(const uint8_t* payload, uint16_t len) {
   if (len >= 1 && payload[0] == 0) {
-    currentDanger = false;
-    currentClosest = 0.0f;
+    alertData.vibrate = false;
+    alertData.closestDistance = 0.0f;
+    alertData.targetCount = 0;
     return;
   }
 
   Target targets[MAX_TARGETS_PER_FRAME];
   uint8_t n = parseTargets(payload, len, targets);
-  if (n > 0) evaluateTargets(targets, n);
+  if (n > 0) processFrameData(targets, n);
 }
 
 void pollRadar() {
@@ -198,22 +195,16 @@ void pollRadar() {
   }
 }
 
-// ----------------------------------------------------------------------
-// Setup & Loop
-// ----------------------------------------------------------------------
-
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  // --- ESP-NOW Setup ---
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");
     return;
   }
   
-  // Clear structure to avoid core v3 initialization issues
   memset(&peerInfo, 0, sizeof(peerInfo)); 
   memcpy(peerInfo.peer_addr, receiverAddress, 6);
   peerInfo.channel = 0;  
@@ -223,23 +214,15 @@ void setup() {
     Serial.println("Failed to add peer");
     return;
   }
-  Serial.println("ESP-NOW initialized.");
 
-  // --- MPU6050 Setup ---
   Wire.begin(21, 22);
   Wire.setClock(400000); 
   Wire.beginTransmission(MPU_addr);
   Wire.write(0x6B); 
   Wire.write(0);    
-  if (Wire.endTransmission() != 0) {
-    while(1) {
-      Serial.println("CRITICAL: Sensor not found on Pins 21/22!");
-      delay(1000);
-    }
-  }
+  Wire.endTransmission();
   previousMillis = millis();
 
-  // --- LD2417 Setup ---
   RADAR_SERIAL.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
 }
 
@@ -248,15 +231,17 @@ void loop() {
 
   unsigned long currentMillis = millis();
 
-  // Stream radar data continuously every 100ms
+  // Populate dynamic MPU values into outgoing stream packet
+  alertData.pitch = pitch;
+  alertData.roll = roll;
+  alertData.gyroZ = gyroZ;
+  alertData.isTurning = isTurning;
+
   if (currentMillis - lastStreamTime >= STREAM_INTERVAL) {
     lastStreamTime = currentMillis;
-    alertData.vibrate = currentDanger;
-    alertData.closestDistance = currentClosest;
     esp_now_send(receiverAddress, (uint8_t *) &alertData, sizeof(alertData));
   }
 
-  // Handle MPU
   if (currentMillis - previousMillis >= interval) {
     float dt = (currentMillis - previousMillis) / 1000.0;
     previousMillis = currentMillis;
@@ -271,9 +256,20 @@ void loop() {
     int16_t AcX = Wire.read()<<8|Wire.read();
     int16_t AcY = Wire.read()<<8|Wire.read();
     int16_t AcZ = Wire.read()<<8|Wire.read();
-    Wire.read(); Wire.read(); 
+    Wire.read(); Wire.read(); // Skip temp
     int16_t GyX = Wire.read()<<8|Wire.read();
     int16_t GyY = Wire.read()<<8|Wire.read();
+    int16_t GyZ = Wire.read()<<8|Wire.read(); // Read Z-axis gyro
+
+    // Convert raw gyro Z to degrees per second
+    gyroZ = GyZ / 131.0;
+
+    // Detect if turning based on angular velocity threshold
+    if (abs(gyroZ) > TURN_THRESHOLD) {
+      isTurning = true;
+    } else {
+      isTurning = false;
+    }
 
     float accPitch = atan2(AcY, AcZ) * 180 / PI;
     float accRoll  = atan2(AcX, sqrt(pow(AcY, 2) + pow(AcZ, 2))) * 180 / PI;
