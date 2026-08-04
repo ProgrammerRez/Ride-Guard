@@ -1,6 +1,6 @@
 /*
   Device 1: HLK-LD2417 Radar + MPU6050 + ESP-NOW Sender
-  Streams full telemetry data including MPU angles, gyro rates, and turn detection.
+  Calibrated based on actual driving telemetry data.
 */
 
 #include <Wire.h>
@@ -12,9 +12,9 @@
 const int MPU_addr = 0x68;
 const float alpha = 0.98;
 float pitch = 0, roll = 0;
-float gyroZ = 0;            // Rotation rate around Z-axis (Yaw)
-bool isTurning = false;     // Turn detection flag
-const float TURN_THRESHOLD = 45.0; // Degrees per second threshold to classify as "Turning"
+float turnRate = 0;         
+bool isTurning = false;     
+const float TURN_THRESHOLD = 35.0; // Adjusted lower based on real test data (~45 deg/s max turns)
 
 unsigned long previousMillis = 0;
 const long interval = 10; 
@@ -47,13 +47,12 @@ uint8_t compactLen = 0;
 // REPLACE WITH THE MAC ADDRESS OF YOUR RECEIVER ESP32
 uint8_t receiverAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
 
-// Expanded structure to stream gyro data, angles, and turn status
 typedef struct struct_message {
   bool vibrate;
   float closestDistance;
   float pitch;
   float roll;
-  float gyroZ;
+  float turnRate;
   bool isTurning;
   uint8_t targetCount;
   Target targets[MAX_TARGETS_PER_FRAME];
@@ -231,10 +230,9 @@ void loop() {
 
   unsigned long currentMillis = millis();
 
-  // Populate dynamic MPU values into outgoing stream packet
   alertData.pitch = pitch;
   alertData.roll = roll;
-  alertData.gyroZ = gyroZ;
+  alertData.turnRate = turnRate;
   alertData.isTurning = isTurning;
 
   if (currentMillis - lastStreamTime >= STREAM_INTERVAL) {
@@ -259,13 +257,12 @@ void loop() {
     Wire.read(); Wire.read(); // Skip temp
     int16_t GyX = Wire.read()<<8|Wire.read();
     int16_t GyY = Wire.read()<<8|Wire.read();
-    int16_t GyZ = Wire.read()<<8|Wire.read(); // Read Z-axis gyro
+    int16_t GyZ = Wire.read()<<8|Wire.read();
 
-    // Convert raw gyro Z to degrees per second
-    gyroZ = GyZ / 131.0;
+    turnRate = GyZ / 131.0; 
 
-    // Detect if turning based on angular velocity threshold
-    if (abs(gyroZ) > TURN_THRESHOLD) {
+    // Updated lower threshold to match actual turning rates found in your log (~35°/s)
+    if (abs(turnRate) > TURN_THRESHOLD) {
       isTurning = true;
     } else {
       isTurning = false;
