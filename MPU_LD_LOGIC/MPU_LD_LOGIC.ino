@@ -1,0 +1,305 @@
+/*
+  Device 1: HLK-LD2417 Radar + MPU6050 + ESP-NOW Sender
+  Calibrated based on actual driving telemetry data.
+  Now includes Speed/TTC analysis and Lean/Turn dynamic danger zones.
+*/
+
+#include <Wire.h>
+#include <Arduino.h>
+#include <math.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+const int MPU_addr = 0x68;
+const float alpha = 0.98;
+float pitch = 0, roll = 0;
+float turnRate = 0;         
+bool isTurning = false;     
+const float TURN_THRESHOLD = 35.0; 
+
+unsigned long previousMillis = 0;
+const long interval = 10; 
+
+#define RADAR_SERIAL        Serial2
+#define RADAR_RX_PIN        16   
+#define RADAR_TX_PIN        17   
+#define RADAR_BAUD          115200  
+
+static const uint8_t FRAME_HEADER[2] = {0xAA, 0xAA};
+static const uint8_t FRAME_TAIL[2]   = {0x55, 0x55};
+static const uint8_t MAX_TARGETS_PER_FRAME = 8;
+static const uint8_t TARGET_RECORD_SIZE = 7;  
+
+static const uint8_t  LANE_COUNT     = 3;
+static const float    LANE_WIDTH_M   = 3.5f;
+static const float    CENTER_OFFSET_M = -5.25f;  
+
+struct Target {
+  float distanceM;
+  float speedKmh;
+  float angleDeg;
+  float lateralM;
+  int8_t lane;  
+};
+
+uint8_t compactFrame[16];
+uint8_t compactLen = 0;
+
+// REPLACE WITH THE MAC ADDRESS OF YOUR RECEIVER ESP32
+uint8_t receiverAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
+
+typedef struct struct_message {
+  bool vibrate;
+  float closestDistance;
+  float pitch;
+  float roll;
+  float turnRate;
+  bool isTurning;
+  uint8_t targetCount;
+  Target targets[MAX_TARGETS_PER_FRAME];
+} struct_message;
+
+struct_message alertData;
+esp_now_peer_info_t peerInfo;
+
+unsigned long lastStreamTime = 0;
+const unsigned long STREAM_INTERVAL = 100; 
+
+int8_t assignLane(float lateralM) {
+  float adjusted = lateralM - CENTER_OFFSET_M;
+  int laneIndex = (int)floor(adjusted / LANE_WIDTH_M);  
+  if (laneIndex >= 0 && laneIndex < LANE_COUNT) {
+    return laneIndex + 1;  
+  }
+  return -1;
+}
+
+uint8_t parseCompactFrame(const uint8_t* frame, uint16_t len, Target* outTargets) {
+  if (len < 10) return 0;
+  if (frame[2] == 0x00) return 0;
+
+  uint16_t rawDistance = frame[5] | (frame[6] << 8);
+  uint16_t rawSpeed = frame[7] | (frame[8] << 8);
+
+  if (rawDistance == 0 && rawSpeed == 0) return 0;
+
+  Target t;
+  t.distanceM = rawDistance / 100.0f;
+  t.speedKmh  = rawSpeed / 100.0f;
+  t.angleDeg  = 0.0f;
+  t.lateralM  = 0.0f;
+  t.lane      = -1;  
+
+  outTargets[0] = t;
+  return 1;
+}
+
+uint8_t parseTargets(const uint8_t* payload, uint16_t payloadLen, Target* outTargets) {
+  if (payloadLen < 1) return 0;
+
+  uint8_t targetCount = payload[0];
+  if (targetCount == 0) return 0;
+  if (targetCount > MAX_TARGETS_PER_FRAME) targetCount = MAX_TARGETS_PER_FRAME;
+
+  uint16_t expectedLen = 1 + (uint16_t)targetCount * TARGET_RECORD_SIZE;
+  if (payloadLen < expectedLen) targetCount = (payloadLen - 1) / TARGET_RECORD_SIZE;
+
+  uint8_t count = 0;
+  uint16_t offset = 1;
+  for (uint8_t i = 0; i < targetCount; i++) {
+    uint8_t direction = payload[offset];
+    uint16_t rawDistance = payload[offset + 1] | (payload[offset + 2] << 8);
+    uint16_t rawSpeed = payload[offset + 3] | (payload[offset + 4] << 8);
+    offset += TARGET_RECORD_SIZE;
+
+    if (rawDistance == 0 && rawSpeed == 0) continue;
+
+    Target t;
+    t.distanceM = rawDistance / 100.0f;
+    t.speedKmh  = rawSpeed / 100.0f;
+    t.angleDeg  = (direction == 1) ? -45.0f : (direction == 2) ? 45.0f : 0.0f;
+    t.lateralM  = t.distanceM * sinf(radians(t.angleDeg));
+    t.lane      = assignLane(t.lateralM);
+
+    outTargets[count++] = t;
+    if (count >= MAX_TARGETS_PER_FRAME) break;
+  }
+  return count;
+}
+
+void processFrameData(Target* targets, uint8_t n) {
+  bool danger = false;
+  float closest = 999.0f;
+  
+  alertData.targetCount = n;
+  for (uint8_t i = 0; i < n; i++) {
+    alertData.targets[i] = targets[i];
+    
+    float dist = targets[i].distanceM;
+    float speed = targets[i].speedKmh; // Relative approach speed
+    
+    if (dist > 0.0f) {
+      if (dist < closest) {
+        closest = dist;
+      }
+      
+      // Calculate Time-To-Collision (TTC) for approaching vehicles
+      float ttc = 999.0f;
+      if (speed > 5.0f) { // If vehicle is closing gap at > 5km/h
+        float speed_ms = speed / 3.6f; // Convert km/h to m/s
+        ttc = dist / speed_ms;
+      }
+
+      // --- LOGIC 2: Speed and Distance Baseline ---
+      // Danger if an object is blindly close (< 5m) OR will hit us in < 2.5 seconds
+      bool standardDanger = (dist < 5.0f) || (ttc < 2.5f);
+
+      // --- LOGIC 3: Lean Angle & Turning Vulnerability ---
+      // Detect if bike is leaning (checking both axes due to your specific orientation logs)
+      bool isLeaning = (abs(roll) > 20.0f) || (abs(pitch) > 40.0f);
+      bool turningDanger = false;
+      
+      if (isTurning || isLeaning) {
+        // When turning, expand the safety bubble (more distance, earlier warning)
+        if (dist < 15.0f || ttc < 4.0f) {
+          turningDanger = true;
+        }
+      }
+
+      // Trigger vibration if either condition is met
+      if (standardDanger || turningDanger) {
+        danger = true;
+      }
+    }
+  }
+  
+  alertData.vibrate = danger;
+  alertData.closestDistance = (closest == 999.0f) ? 0.0f : closest;
+}
+
+void handleCompactFrame(const uint8_t* frame, uint16_t len) {
+  if (len == 5 && frame[2] == 0x00) {
+    alertData.vibrate = false;
+    alertData.closestDistance = 0.0f;
+    alertData.targetCount = 0;
+    return;
+  }
+
+  Target targets[MAX_TARGETS_PER_FRAME];
+  uint8_t n = parseCompactFrame(frame, len, targets);
+  if (n > 0) processFrameData(targets, n);
+}
+
+void handleFrame(const uint8_t* payload, uint16_t len) {
+  if (len >= 1 && payload[0] == 0) {
+    alertData.vibrate = false;
+    alertData.closestDistance = 0.0f;
+    alertData.targetCount = 0;
+    return;
+  }
+
+  Target targets[MAX_TARGETS_PER_FRAME];
+  uint8_t n = parseTargets(payload, len, targets);
+  if (n > 0) processFrameData(targets, n);
+}
+
+void pollRadar() {
+  while (RADAR_SERIAL.available()) {
+    uint8_t b = (uint8_t)RADAR_SERIAL.read();
+
+    if (compactLen == 0 && b != FRAME_HEADER[0]) continue;
+    if (compactLen == 1 && b != FRAME_HEADER[1]) { compactLen = 0; continue; }
+    compactFrame[compactLen++] = b;
+    if (compactLen >= sizeof(compactFrame)) { compactLen = 0; continue; }
+
+    if (compactLen == 5 && compactFrame[2] == 0x00 &&
+        compactFrame[3] == FRAME_TAIL[0] && compactFrame[4] == FRAME_TAIL[1]) {
+      handleCompactFrame(compactFrame, 5);
+      compactLen = 0;
+    } else if (compactLen == 10) {
+      handleCompactFrame(compactFrame, 10);
+      compactLen = 0;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  
+  memset(&peerInfo, 0, sizeof(peerInfo)); 
+  memcpy(peerInfo.peer_addr, receiverAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  Wire.begin(21, 22);
+  Wire.setClock(400000); 
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x6B); 
+  Wire.write(0);    
+  Wire.endTransmission();
+  previousMillis = millis();
+
+  RADAR_SERIAL.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+}
+
+void loop() {
+  pollRadar();
+
+  unsigned long currentMillis = millis();
+
+  alertData.pitch = pitch;
+  alertData.roll = roll;
+  alertData.turnRate = turnRate;
+  alertData.isTurning = isTurning;
+
+  if (currentMillis - lastStreamTime >= STREAM_INTERVAL) {
+    lastStreamTime = currentMillis;
+    esp_now_send(receiverAddress, (uint8_t *) &alertData, sizeof(alertData));
+  }
+
+  if (currentMillis - previousMillis >= interval) {
+    float dt = (currentMillis - previousMillis) / 1000.0;
+    previousMillis = currentMillis;
+
+    Wire.beginTransmission(MPU_addr);
+    Wire.write(0x3B);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_addr, 14, true);
+
+    if (Wire.available() < 14) return;
+
+    int16_t AcX = Wire.read()<<8|Wire.read();
+    int16_t AcY = Wire.read()<<8|Wire.read();
+    int16_t AcZ = Wire.read()<<8|Wire.read();
+    Wire.read(); Wire.read(); // Skip temp
+    int16_t GyX = Wire.read()<<8|Wire.read();
+    int16_t GyY = Wire.read()<<8|Wire.read();
+    int16_t GyZ = Wire.read()<<8|Wire.read();
+
+    turnRate = GyZ / 131.0; 
+
+    if (abs(turnRate) > TURN_THRESHOLD) {
+      isTurning = true;
+    } else {
+      isTurning = false;
+    }
+
+    float accPitch = atan2(AcY, AcZ) * 180 / PI;
+    float accRoll  = atan2(AcX, sqrt(pow(AcY, 2) + pow(AcZ, 2))) * 180 / PI;
+
+    pitch = alpha * (pitch + (GyX / 131.0) * dt) + (1.0 - alpha) * accPitch;
+    roll  = alpha * (roll  + (GyY / 131.0) * dt) + (1.0 - alpha) * accRoll;
+  }
+}

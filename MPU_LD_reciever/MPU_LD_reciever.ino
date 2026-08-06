@@ -1,6 +1,6 @@
 /*
-  Device 2: ESP-NOW Receiver + Extended Vibration + Full Telemetry Processing
-  Receives radar targets, MPU orientation angles, gyro rates, and turn status.
+  Device 2: ESP-NOW Receiver + Haptic Language System
+  Receives radar targets and IMU data to drive dynamic vibration patterns based on threat severity.
 */
 
 #include <esp_now.h>
@@ -16,7 +16,7 @@ struct Target {
   int8_t lane;  
 };
 
-// Must exactly match the Sender's updated struct layout
+// Must exactly match the Sender's struct layout
 typedef struct struct_message {
     bool vibrate;
     float closestDistance;
@@ -29,27 +29,43 @@ typedef struct struct_message {
 } struct_message;
 
 struct_message myData;
-unsigned long lastRecvTime = 0;
 
+// Timing and State Variables
+unsigned long lastRecvTime = 0;
 unsigned long motorTurnOffTime = 0;
-const unsigned long VIBRATION_DURATION_MS = 2000; // Minimum 2 second pulse
+const unsigned long VIBRATION_LIFESPAN_MS = 1500; 
+
+// Haptic Pattern Variables
+uint8_t threatLevel = 0; // 0=Off, 1=Caution, 2=Warning, 3=Critical
+unsigned long hapticPreviousMillis = 0;
+bool hapticState = false;
 
 void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
   memcpy(&myData, incomingData, sizeof(myData));
   lastRecvTime = millis();
   
-  // Print status of the vehicle and motion metrics
   Serial.printf("[Telemetry] Pitch: %.1f° | Roll: %.1f° | GyroZ: %.1f°/s | Turning: %s\n", 
                 myData.pitch, myData.roll, myData.gyroZ, myData.isTurning ? "YES" : "NO");
 
-  if (myData.vibrate) {
-    motorTurnOffTime = millis() + VIBRATION_DURATION_MS;
-    Serial.printf(">>> ALERT! Closest Target: %.2f m (Total targets: %u)\n", myData.closestDistance, myData.targetCount);
+  if (myData.vibrate && myData.closestDistance > 0.0f) {
+    motorTurnOffTime = millis() + VIBRATION_LIFESPAN_MS;
     
-    for(uint8_t i = 0; i < myData.targetCount; i++) {
-      Serial.printf("    -> Target %d: Dist=%.2fm, Speed=%.1fkm/h, Lane=%d\n", 
-        i, myData.targets[i].distanceM, myData.targets[i].speedKmh, myData.targets[i].lane);
+    // Evaluate leaning/turning vulnerability
+    bool isLeaning = (abs(myData.roll) > 20.0f) || (abs(myData.pitch) > 40.0f);
+    bool corneringDanger = myData.isTurning || isLeaning;
+
+    // --- DETERMINE THREAT LEVEL ---
+    if (myData.closestDistance <= 5.0f || (corneringDanger && myData.closestDistance <= 15.0f)) {
+      threatLevel = 3; // CRITICAL: Very close, or cornering with a vehicle nearby
+    } 
+    else if (myData.closestDistance <= 10.0f) {
+      threatLevel = 2; // WARNING: Standard danger zone
+    } 
+    else {
+      threatLevel = 1; // CAUTION: Further out, but fast approaching (TTC triggered from Sender)
     }
+
+    Serial.printf(">>> ALERT! Threat Level: %d | Closest Target: %.2f m\n", threatLevel, myData.closestDistance);
   }
 }
 
@@ -76,16 +92,36 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Failsafe: Turn off motor if connection is lost for more than 2 seconds
-  if (now - lastRecvTime > 2000) {
+  // Failsafe: Turn off if connection lost OR if vibration lifespan expires
+  if ((now - lastRecvTime > 2000) || (now > motorTurnOffTime)) {
+    threatLevel = 0;
+    hapticState = false;
     digitalWrite(MOTOR_PIN, LOW);
   } else {
-    if (now < motorTurnOffTime) {
+    
+    // --- HAPTIC PATTERN EXECUTION ---
+    if (threatLevel == 3) {
+      // CRITICAL: Solid, unbroken vibration
       digitalWrite(MOTOR_PIN, HIGH);
-    } else {
-      digitalWrite(MOTOR_PIN, LOW);
+    } 
+    else if (threatLevel == 2) {
+      // WARNING: Fast Pulse (150ms ON / 150ms OFF)
+      if (now - hapticPreviousMillis >= 150) {
+        hapticPreviousMillis = now;
+        hapticState = !hapticState;
+        digitalWrite(MOTOR_PIN, hapticState ? HIGH : LOW);
+      }
+    } 
+    else if (threatLevel == 1) {
+      // CAUTION: Slow Pulse (400ms ON / 400ms OFF)
+      if (now - hapticPreviousMillis >= 400) {
+        hapticPreviousMillis = now;
+        hapticState = !hapticState;
+        digitalWrite(MOTOR_PIN, hapticState ? HIGH : LOW);
+      }
     }
   }
   
-  delay(10);
+  // A tiny delay yields time to the ESP32's background WiFi tasks
+  delay(5); 
 }
