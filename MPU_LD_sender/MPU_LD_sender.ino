@@ -11,14 +11,14 @@
 
 // --- HARDWARE & TIMING CONSTANTS ---
 const int MPU_addr = 0x68;
-const float alpha = 0.98;
+const float alpha = 0.96; // Adjusted for better drift suppression
 const float TURN_THRESHOLD = 35.0; 
 const long IMU_INTERVAL = 10; 
 const unsigned long STREAM_INTERVAL = 100; 
 
 #define RADAR_SERIAL        Serial2
-#define RADAR_RX_PIN        16   
-#define RADAR_TX_PIN        17   
+#define RADAR_RX_PIN        16    
+#define RADAR_TX_PIN        17    
 #define RADAR_BAUD          115200  
 
 static const uint8_t FRAME_HEADER[2] = {0xAA, 0xAA};
@@ -30,7 +30,6 @@ static const uint8_t  LANE_COUNT     = 3;
 static const float    LANE_WIDTH_M   = 3.5f;
 static const float    CENTER_OFFSET_M = -5.25f;  
 
-// REPLACE WITH THE MAC ADDRESS OF YOUR RECEIVER ESP32
 uint8_t receiverAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
 
 // --- DATA STRUCTURES ---
@@ -42,7 +41,6 @@ struct Target {
   int8_t lane;  
 };
 
-// Internal struct to hold all live telemetry
 struct SensorData {
   float pitch;
   float roll;
@@ -53,7 +51,6 @@ struct SensorData {
   Target targets[MAX_TARGETS_PER_FRAME];
 };
 
-// ESP-NOW Payload struct
 typedef struct struct_message {
   bool vibrate;
   float closestDistance;
@@ -65,17 +62,19 @@ typedef struct struct_message {
   Target targets[MAX_TARGETS_PER_FRAME];
 } struct_message;
 
-// Decision Literal State
 enum DecisionState {
   STATE_SAFE,
   STATE_DANGER
 };
 
-// --- GLOBALS ---
 uint8_t compactFrame[16];
 uint8_t compactLen = 0;
 struct_message alertData;
 esp_now_peer_info_t peerInfo;
+
+// Hard-zero offset calibration variables
+float accPitchZero = 0.0f;
+float accRollZero = 0.0f;
 
 
 // ==========================================
@@ -111,7 +110,6 @@ uint8_t parseCompactFrame(const uint8_t* frame, uint16_t len, Target* outTargets
   return 1;
 }
 
-// Maps parsed radar frames into the live SensorData object
 void processFrameData(Target* targets, uint8_t n, SensorData* data) {
   float closest = 999.0f;
   data->targetCount = n;
@@ -161,14 +159,12 @@ void pollRadar(SensorData* data) {
 // 1. CALCULATION FUNCTION
 // ==========================================
 SensorData calculateSensorData() {
-  static SensorData data = {0}; // Persists state across loops
+  static SensorData data = {0}; 
   static unsigned long previousMillis = 0;
   unsigned long currentMillis = millis();
 
-  // Update Radar Data (Modifies the 'data' struct directly via reference)
   pollRadar(&data);
 
-  // Update IMU Data based on interval
   if (currentMillis - previousMillis >= IMU_INTERVAL) {
     float dt = (currentMillis - previousMillis) / 1000.0;
     previousMillis = currentMillis;
@@ -190,15 +186,21 @@ SensorData calculateSensorData() {
       data.turnRate = GyZ / 131.0; 
       data.isTurning = (abs(data.turnRate) > TURN_THRESHOLD);
 
-      float accPitch = atan2(AcY, AcZ) * 180 / PI;
-      float accRoll  = atan2(AcX, sqrt(pow(AcY, 2) + pow(AcZ, 2))) * 180 / PI;
+      // Raw accelerometer angles relative to gravity vector
+      float accPitch = atan2(AcY, sqrt((long)AcX * AcX + (long)AcZ * AcZ)) * 180.0 / PI;
+      float accRoll  = atan2(AcX, sqrt((long)AcY * AcY + (long)AcZ * AcZ)) * 180.0 / PI;
 
+      // Subtract zero-offsets captured on startup
+      accPitch -= accPitchZero;
+      accRoll  -= accRollZero;
+
+      // Clean complementary filter implementation preventing accumulation windup
       data.pitch = alpha * (data.pitch + (GyX / 131.0) * dt) + (1.0 - alpha) * accPitch;
       data.roll  = alpha * (data.roll  + (GyY / 131.0) * dt) + (1.0 - alpha) * accRoll;
     }
   }
   
-  return data; // Returns the unified sensor packet
+  return data;
 }
 
 
@@ -206,11 +208,10 @@ SensorData calculateSensorData() {
 // 2. DECISION FUNCTION
 // ==========================================
 DecisionState makeDecision(SensorData data) {
-  // Evaluates telemetry and passes back a state literal
-  if (data.closestDistance > 0.0f && data.closestDistance < 10.0f) {
+  // Only trigger active warning state if a target is within valid threat range (<= 15m)
+  if (data.closestDistance > 0.0f && data.closestDistance <= 15.0f) {
     return STATE_DANGER; 
   }
-  
   return STATE_SAFE;
 }
 
@@ -222,14 +223,10 @@ void transmitData(SensorData data, DecisionState state) {
   static unsigned long lastStreamTime = 0;
   unsigned long currentMillis = millis();
 
-  // Only stream at defined intervals to prevent ESP-NOW flooding
   if (currentMillis - lastStreamTime >= STREAM_INTERVAL) {
     lastStreamTime = currentMillis;
 
-    // Apply the Decision State
     alertData.vibrate = (state == STATE_DANGER);
-    
-    // Apply the Telemetry Data
     alertData.closestDistance = data.closestDistance;
     alertData.pitch = data.pitch;
     alertData.roll = data.roll;
@@ -241,7 +238,6 @@ void transmitData(SensorData data, DecisionState state) {
       alertData.targets[i] = data.targets[i];
     }
 
-    // Transmit
     esp_now_send(receiverAddress, (uint8_t *) &alertData, sizeof(alertData));
   }
 }
@@ -277,16 +273,33 @@ void setup() {
   Wire.write(0);    
   Wire.endTransmission();
 
+  // Multi-sample baseline zeroing on startup (Keep bike steady on boot!)
+  delay(500);
+  long sumPitch = 0, sumRoll = 0;
+  int samples = 20;
+  
+  for(int i = 0; i < samples; i++) {
+    Wire.beginTransmission(MPU_addr);
+    Wire.write(0x3B);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_addr, 6, true);
+    if (Wire.available() >= 6) {
+      int16_t AcX = Wire.read()<<8|Wire.read();
+      int16_t AcY = Wire.read()<<8|Wire.read();
+      int16_t AcZ = Wire.read()<<8|Wire.read();
+      sumPitch += (long)(atan2(AcY, sqrt((long)AcX * AcX + (long)AcZ * AcZ)) * 180.0 / PI);
+      sumRoll  += (long)(atan2(AcX, sqrt((long)AcY * AcY + (long)AcZ * AcZ)) * 180.0 / PI);
+    }
+    delay(20);
+  }
+  accPitchZero = (float)sumPitch / samples;
+  accRollZero  = (float)sumRoll / samples;
+
   RADAR_SERIAL.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
 }
 
 void loop() {
-  // 1. Calculation
   SensorData currentData = calculateSensorData();
-
-  // 2. Decision 
   DecisionState currentState = makeDecision(currentData);
-
-  // 3. Output
   transmitData(currentData, currentState);
 }
